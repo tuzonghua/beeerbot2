@@ -1,27 +1,99 @@
 import operator
 import random
 from collections import defaultdict
-from time import time
-import logging
-import discord
-from discord.ext import tasks, commands
-import DiscordUtils
+from threading import Lock
+from time import sleep, time
+from typing import Dict, List, NamedTuple, TypeVar
 
-from sqlalchemy import Column, String, Boolean, Integer, insert, delete, select, update, desc
-from util import database
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Table,
+    and_,
+    desc,
+)
+from sqlalchemy.sql import select
 
 
+duck_tail = "・゜゜・。。・゜゜"
+duck = [
+    "\\_o< ",
+    "\\_O< ",
+    "\\_0< ",
+    "\\_\u00f6< ",
+    "\\_\u00f8< ",
+    "\\_\u00f3< ",
+]
+duck_noise = ["QUACK!", "FLAP FLAP!", "quack!"]
 
+
+class ScoreEntry(NamedTuple):
+    network: str
+    name: str
+    chan: str
+    shot: int = 0
+    befriend: int = 0
+
+
+class ChannelState:
+    """
+    Represents the state of the hunt in a single channel
+    """
+
+    def __init__(self):
+        self.masks = []
+        self.messages = 0
+        self.game_on = False
+        self.no_duck_kick = False
+        self.duck_status = 0
+        self.next_duck_time = 0
+        self.duck_time = 0
+        self.shoot_time = 0
+
+    def clear_messages(self):
+        self.messages = 0
+        self.masks.clear()
+
+    def should_deploy(self, conn):
+        """Should we deploy a duck?"""
+        msg_delay = get_config(conn, "minimum_messages", 10)
+        mask_req = get_config(conn, "minimum_users", 5)
+        return (
+            self.game_on
+            and self.duck_status == 0
+            and self.next_duck_time <= time()
+            and self.messages >= msg_delay
+            and len(self.masks) >= mask_req
+        )
+
+    def handle_message(self, event):
+        if self.game_on and self.duck_status == 0:
+            self.messages += 1
+            if event.host not in self.masks:
+                self.masks.append(event.host)
+
+
+T = TypeVar("T")
+ConnMap = Dict[str, Dict[str, T]]
+scripters: Dict[str, float] = defaultdict(float)
+chan_locks: ConnMap[Lock] = defaultdict(lambda: defaultdict(Lock))
+game_status: ConnMap[ChannelState] = defaultdict(
+    lambda: defaultdict(ChannelState)
+)
+opt_out: Dict[str, List[str]] = defaultdict(list)
 """
-self.game_status structure 
-{ 
+self.game_status structure
+{
     'guild.id':{
         'channel.id':{
-            'duck_status':0|1|2, 
-            'next_duck_time':'integer', 
+            'duck_status':0|1|2,
+            'next_duck_time':'integer',
             'game_on':0|1,
             'no_duck_kick': 0|1,
-            'duck_time': 'float', 
+            'duck_time': 'float',
             'shoot_time': 'float',
             'messages': integer,
             'masks': list,
@@ -63,7 +135,7 @@ class Duckhunt(commands.Cog):
         self.nohunt_table = NoHuntTable
 
         self.delete_source_msg = False
-        
+
         #Set up duck parts
         self.duck_tail = "・゜゜・。。・゜゜"
         self.duck = ["\_o< ", "\_O< ", "\_0< ", "\_\u00f6< ", "\_\u00f8< ", "\_\u00f3< "]
@@ -74,7 +146,7 @@ class Duckhunt(commands.Cog):
         self.game_status = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
         # set optout status
         self.opt_out = []
-        
+
         #chans = self.db.execute(select([self.optout.c.chan]))
         stmt = select(self.nohunt_table).order_by(self.nohunt_table.chan)
         for row in self.db.execute(stmt).scalars().all():
@@ -82,7 +154,7 @@ class Duckhunt(commands.Cog):
             self.opt_out.append(chan)
 
         #set up duck times for all channels
-        try: 
+        try:
             stmt = select(self.status_table)
             for row in self.db.execute(stmt).scalars().all():
                 net = str(row.network)
@@ -106,7 +178,7 @@ class Duckhunt(commands.Cog):
     def cog_unload(self):
         # self.save_status.cancel()
         self.deploy_duck.cancel()
-        
+
 
     @tasks.loop(seconds=10.0)
     async def deploy_duck(self):
@@ -125,7 +197,7 @@ class Duckhunt(commands.Cog):
                         self.game_status[network][chan]['duck_time'] = time()
                         dtail, dbody, dnoise = self.generate_duck()
                         channel = self.bot.get_channel(int(chan))
-                        
+
                         self.log.info("channel check: {}".format(repr(channel)))
                         em = discord.Embed(
                             title="a duck has appeared",
@@ -136,7 +208,7 @@ class Duckhunt(commands.Cog):
                         self.game_status[network][chan]['duck_message_id'] = duck_message.id
                         self.log.info("deploying duck to {}".format(channel.name))
                     except:
-                        
+
                         self.log.error("error deploying duck to {}".format(chan, exc_info=1))
 
                 # Leave this commented out for now. I haven't decided how to make ducks leave.
@@ -157,7 +229,7 @@ class Duckhunt(commands.Cog):
                     active = bool(status['game_on'])
                     duck_kick = bool(status['no_duck_kick'])
                     stmt = update(self.status_table).where(
-                        self.status_table.chan == chan, 
+                        self.status_table.chan == chan,
                         self.status_table.network == network
                     ).values(
                         active=active, duck_kick=duck_kick
@@ -165,9 +237,9 @@ class Duckhunt(commands.Cog):
                     res = self.db.execute(stmt)
                     if not res.rowcount:
                         stmt = insert(self.status_table).values(
-                            network=network, 
-                            chan=chan, 
-                            active=active, 
+                            network=network,
+                            chan=chan,
+                            active=active,
                             duck_kick=duck_kick
                         )
                         self.db.execute(stmt)
@@ -217,7 +289,7 @@ class Duckhunt(commands.Cog):
                 befriend=friend,
                 shot=shoot
             )
-        
+
         self.db.execute(stmt)
         self.db.commit()
 
@@ -278,7 +350,7 @@ class Duckhunt(commands.Cog):
         guild_id = str(getattr(msg.guild, 'id', None))
         channel_id = str(getattr(msg.channel, 'id', None))
         author_id = str(getattr(msg.author, 'id', None))
-        
+
         if channel_id in self.opt_out:
             return
         if self.game_status[guild_id][channel_id]['game_on'] == 1 and self.game_status[guild_id][channel_id]['duck_status'] == 0:
@@ -295,7 +367,7 @@ class Duckhunt(commands.Cog):
         guild_id = str(getattr(ctx.guild, 'id', None))
         channel_id = str(getattr(ctx.channel, 'id', None))
         channel_name = str(getattr(ctx.channel, 'name', None))
-        
+
         if channel_id in self.opt_out:
             return
         elif ctx.guild is None:
@@ -377,7 +449,7 @@ class Duckhunt(commands.Cog):
         channel_id = str(getattr(ctx.channel, 'id', None))
         channel_name = str(getattr(ctx.channel, 'name', None))
         author_name = str(getattr(ctx.author, 'name', None))
-        
+
         if channel_id in self.opt_out:
             return
 
@@ -460,7 +532,7 @@ class Duckhunt(commands.Cog):
             # https://i.imgur.com/0Eyajax.png
 
             out = await ctx.send("{} you shot a duck in {} seconds! You have killed {} {} in {}.".format(author_name, timer, score, duck, channel_name))
-            
+
             await out.delete(delay=30)
             if self.delete_source_msg:
                 await ctx.message.delete(delay=10)
@@ -472,7 +544,7 @@ class Duckhunt(commands.Cog):
                 color=996666)
             em.set_thumbnail(url="https://i.imgur.com/0Eyajax.png")
             em.set_footer(text="{} pulled the trigger in {} seconds".format(author_name, timer))
-            
+
             duck_message = await ctx.channel.fetch_message(self.game_status[guild_id][channel_id]['duck_message_id'])
             await duck_message.edit(embed=em)
             self.set_ducktime(channel_id, guild_id)
@@ -484,7 +556,7 @@ class Duckhunt(commands.Cog):
         channel_id = str(getattr(ctx.channel, 'id', None))
         channel_name = str(getattr(ctx.channel, 'name', None))
         author_name = str(getattr(ctx.author, 'name', None))
-        
+
         if channel_id in self.opt_out:
             return
 
@@ -504,7 +576,7 @@ class Duckhunt(commands.Cog):
             #TODO: Mute
             #if self.game_status[guild_id][channel_id]['no_duck_kick'] == 1:
                 #out = "KICK {} {} :You tried befriending a non-existent duck. That's fucking creepy.".format(chan, nick)
-                
+
             out = await ctx.send("You tried befriending a non-existent duck. That's freaking creepy.")
             await out.delete(delay=20)
             if self.delete_source_msg:
@@ -517,7 +589,7 @@ class Duckhunt(commands.Cog):
             if author_name in self.scripters:
                 if self.scripters[author_name] > shoot:
                     out = await ctx.send("You are in a cool down period, you can try again in {} seconds.".format(str(self.scripters[author_name] - shoot)))
-                            
+
                     await out.delete(delay=20)
                     if self.delete_source_msg:
                         await ctx.message.delete(delay=10)
@@ -550,7 +622,7 @@ class Duckhunt(commands.Cog):
                     return
 
             self.game_status[guild_id][channel_id]['duck_status'] = 2
-            
+
             stmt = select(self.table.befriend).where(
                 self.table.network == guild_id,
                 self.table.chan == channel_id,
@@ -570,18 +642,18 @@ class Duckhunt(commands.Cog):
             # https://i.imgur.com/XF11gK4.png
             out = await ctx.send(
                 "{} you befriended a duck in {} seconds! You have made friends with {} {} in {}.".format(author_name, timer, score, duck, channel_name))
-                
+
             await out.delete(delay=30)
             if self.delete_source_msg:
                 await ctx.message.delete(delay=60)
-                                                                                                        
+
             em = discord.Embed(
                 title="this duck has been befriended",
                 description="fly on little ducky",
                 color=996666)
             em.set_thumbnail(url="https://i.imgur.com/XF11gK4.png")
             em.set_footer(text="{} seduced it in {} seconds".format(author_name, timer))
-            
+
             duck_message = await ctx.channel.fetch_message(self.game_status[guild_id][channel_id]['duck_message_id'])
             await duck_message.edit(embed=em)
             self.set_ducktime(channel_id, guild_id)
@@ -633,7 +705,7 @@ class Duckhunt(commands.Cog):
         else:
             out = "Duck friend scores in {}: ".format(channel_name)
             stmt = select(self.table).where(
-                self.table.network == guild_id, 
+                self.table.network == guild_id,
                 self.table.chan == channel_id
             ).order_by(desc(self.table.befriend))
             scores = self.db.execute(stmt).scalars().all()
@@ -649,7 +721,7 @@ class Duckhunt(commands.Cog):
                     await ctx.message.delete(delay=10)
                 return
 
-        try: 
+        try:
             paginator = DiscordUtils.Pagination.AutoEmbedPaginator(ctx, auto_footer=True, remove_reactions=True, timeout=60)
             topfriends = sorted(friends.items(), key=operator.itemgetter(1), reverse=True)
 
@@ -685,7 +757,7 @@ class Duckhunt(commands.Cog):
                     rank_2_1 = rank_1_1+10
                     rank_2_2 = rank_1_2+remaining
                     del topfriends
-                
+
                 for k, v in field2:
                     if i % 10 == int(0):
                         newline = ""
@@ -752,7 +824,7 @@ class Duckhunt(commands.Cog):
         else:
             out = "Duck killer scores in {}: ".format(channel_name)
             stmt = select(self.table).where(
-                self.table.network == guild_id, 
+                self.table.network == guild_id,
                 self.table.chan == channel_id
             ).order_by(desc(self.table.shot))
             scores = self.db.execute(stmt).scalars().all()
@@ -769,7 +841,7 @@ class Duckhunt(commands.Cog):
                 if self.delete_source_msg:
                     await ctx.message.delete(delay=10)
                 return
-        try: 
+        try:
             paginator = DiscordUtils.Pagination.AutoEmbedPaginator(ctx, auto_footer=True, remove_reactions=True, timeout=60)
             topkillers = sorted(killers.items(), key=operator.itemgetter(1), reverse=True)
 
@@ -806,7 +878,7 @@ class Duckhunt(commands.Cog):
                     rank_2_1 = rank_1_1+10
                     rank_2_2 = rank_1_2+remaining
                     del topkillers
-                
+
                 for k, v in field2:
                     if i % 10 == int(0):
                         newline = ""
@@ -850,13 +922,13 @@ class Duckhunt(commands.Cog):
                 await ctx.message.delete(delay=10)
             return
         stmt = select(self.table).where(
-            self.table.network == guild_id, 
+            self.table.network == guild_id,
             self.table.name == oldnick
         ).order_by(desc(self.table.shot))
         oldnickscore = self.db.execute(stmt).scalars().all()
 
         stmt = select(self.table).where(
-            self.table.network == guild_id, 
+            self.table.network == guild_id,
             self.table.name == oldnick
         ).order_by(desc(self.table.shot))
         newnickscore = self.db.execute(stmt).scalars().all()
@@ -893,9 +965,9 @@ class Duckhunt(commands.Cog):
                 self.dbadd_entry(newnick, channel, guild_id, duckmerge[channel]["shot"], duckmerge[channel]["befriend"])
             for channel in channelkey["update"]:
                 self.dbupdate(newnick, channel, guild_id, duckmerge[channel]["shot"], duckmerge[channel]["befriend"])
-                
+
             stmt = delete(self.table).where(
-                self.table.network == guild_id, 
+                self.table.network == guild_id,
                 self.table.name == oldnick
             )
             self.db.execute(stmt)
@@ -931,11 +1003,11 @@ class Duckhunt(commands.Cog):
         ducks = defaultdict(int)
 
         stmt = select(self.table).where(
-            self.table.network == guild_id, 
+            self.table.network == guild_id,
             self.table.name == name
         )
         scores = self.db.execute(stmt).scalars().all()
-                            
+
         if scores:
             for row in scores:
                 if row.chan == channel_id:
@@ -976,7 +1048,7 @@ class Duckhunt(commands.Cog):
         guild_id = str(getattr(ctx.guild, 'id', None))
         channel_id = str(getattr(ctx.channel, 'id', None))
         channel_name = str(getattr(ctx.channel, 'name', None))
-        
+
         ducks = defaultdict(int)
         stmt = select(self.table).where(
             self.table.network == guild_id
